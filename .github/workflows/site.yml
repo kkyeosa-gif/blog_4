@@ -1,0 +1,130 @@
+name: Publish and deploy site
+
+on:
+  # Four checks an hour, off the top of the hour (GitHub drops or delays many
+  # :00 schedules). scripts/publish-due.mjs publishes one post per slot
+  # (8am, 11am, 1pm, 4pm, 8pm ET) and no-ops otherwise; a missed check is
+  # caught up by the next one.
+  schedule:
+    - cron: "7,22,37,52 * * * *"
+  # A person pushing a post/image/layout change rebuilds the site.
+  push:
+    paths:
+      - "posts/published/**"
+      - "images/**"
+      - "scripts/build-site.mjs"
+      - "scripts/lib.mjs"
+  workflow_dispatch:
+    inputs:
+      force:
+        description: "Publish the next ready post now, ignoring the slot"
+        required: false
+        default: false
+        type: boolean
+
+concurrency:
+  group: site
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      issues: write
+    outputs:
+      deploy: ${{ steps.decide.outputs.deploy }}
+    env:
+      ALERT_FILE: alert.md
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      # Safety net: images that failed in generate-posts get another try
+      # before their post's slot.
+      - name: Generate any missing images
+        if: github.event_name != 'push'
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          OPENAI_IMAGE_MODEL: ${{ vars.OPENAI_IMAGE_MODEL }}
+          OPENAI_IMAGE_QUALITY: ${{ vars.OPENAI_IMAGE_QUALITY }}
+        run: node scripts/generate-images.mjs || echo "::warning::image generation failed; posts missing images are held"
+
+      - name: Publish the next post if a slot is due
+        id: pub
+        if: github.event_name != 'push'
+        env:
+          FORCE_PUBLISH: ${{ inputs.force }}
+        run: node scripts/publish-due.mjs
+
+      - name: Commit
+        if: github.event_name != 'push'
+        run: |
+          git config user.name "content-bot"
+          git config user.email "actions@users.noreply.github.com"
+          git add posts images tasks
+          git diff --cached --quiet && exit 0
+          git commit -m "Publish scheduled post"
+          for i in 1 2 3 4 5; do
+            git pull --rebase -q origin "${{ github.event.repository.default_branch }}" && git push && break
+            sleep $((i * 5))
+          done
+
+      - name: Decide whether to deploy
+        id: decide
+        run: |
+          # Pushes to other branches never deploy (Pages only serves the default branch).
+          if [ "${{ github.event_name }}" = "push" ] && [ "${{ github.ref_name }}" != "${{ github.event.repository.default_branch }}" ]; then
+            echo "deploy=false" >> "$GITHUB_OUTPUT"
+          elif [ "${{ github.event_name }}" != "schedule" ] || [ "${{ steps.pub.outputs.published }}" = "true" ]; then
+            echo "deploy=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "deploy=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Alert on problems
+        if: always()
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          JOB_STATUS: ${{ job.status }}
+        run: node scripts/open-alert.mjs
+
+  deploy:
+    needs: publish
+    if: needs.publish.outputs.deploy == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      # Build from the live tip, which includes the publish commit above.
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Build
+        env:
+          SITE_URL: ${{ vars.SITE_URL }}
+          ADSENSE_CLIENT: ${{ vars.ADSENSE_CLIENT }}
+          GOOGLE_SITE_VERIFICATION: ${{ vars.GOOGLE_SITE_VERIFICATION }}
+        run: node scripts/build-site.mjs
+
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+      - id: deployment
+        uses: actions/deploy-pages@v4
